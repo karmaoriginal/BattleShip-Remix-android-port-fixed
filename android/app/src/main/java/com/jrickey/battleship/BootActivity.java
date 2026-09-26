@@ -235,9 +235,21 @@ public class BootActivity extends ComponentActivity {
             }
 
             if (rc != 0) {
-                runOnUi(() -> showError(
-                    "ROM extraction failed (code " + rc + "). Logcat tag " +
-                    "ssb64.torch has the detailed error."));
+                final String detail;
+                switch (rc) {
+                    case -3:
+                        detail = "The extraction folder isn't writable:\n" + extDir +
+                            "\n\nFree up space, or check that no other app/File " +
+                            "Manager has this folder open, then try again.";
+                        break;
+                    case -4:
+                        detail = "Couldn't switch into the extraction folder:\n" + extDir;
+                        break;
+                    default:
+                        detail = "ROM extraction failed (code " + rc + "). Logcat tag " +
+                            "ssb64.torch has the detailed error.";
+                }
+                runOnUi(() -> showError(detail));
                 return;
             }
             if (!AssetExtractor.haveExtractedRom(BootActivity.this)) {

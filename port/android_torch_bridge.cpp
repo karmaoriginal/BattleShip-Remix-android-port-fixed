@@ -473,6 +473,43 @@ int torch_extract_o2r(const char *rom_path, const char *src_dir, const char *dst
             return -2;
         }
 
+        // Defensive: confirm dst_dir is actually writable by this process
+        // *before* handing control to Torch. A silent write failure deep
+        // inside Torch's export path is what produces the confusing
+        // "success but file missing" symptom instead of a clear error here.
+        const std::filesystem::path dst_path(dst_dir);
+        const std::filesystem::path probe = dst_path / ".torch_write_probe";
+        {
+            std::ofstream probe_f(probe, std::ios::binary | std::ios::trunc);
+            if (!probe_f) {
+                LOGE("torch_extract_o2r: dst_dir is not writable: %s", dst_dir);
+                return -3;
+            }
+            probe_f << "x";
+        }
+        std::filesystem::remove(probe, ec);
+
+        // Torch resolves config.yml's `output.binary` (a bare relative
+        // filename, e.g. "BattleShip.o2r") against the process's *current
+        // working directory* — see BUILDING.md: "it loads BattleShip.o2r
+        // relative to the working directory". On desktop that's harmless
+        // because the binary is always launched from its own build/install
+        // dir. On Android there's no such guarantee: the app process's CWD
+        // is whatever the OS handed it, not externalFilesDir, so the
+        // archive can be written somewhere the app never looks while Torch
+        // still reports success. Chdir into dst_dir for the call so the
+        // relative write lands where AssetExtractor.haveExtractedRom()
+        // actually checks, then restore the original CWD afterward.
+        std::error_code cwd_ec;
+        const std::filesystem::path original_cwd = std::filesystem::current_path(cwd_ec);
+        const bool have_original_cwd = !cwd_ec;
+        std::filesystem::current_path(dst_path, cwd_ec);
+        if (cwd_ec) {
+            LOGE("torch_extract_o2r: chdir to dst_dir failed: %s (%s)",
+                 dst_dir, cwd_ec.message().c_str());
+            return -4;
+        }
+
         Companion *instance = new Companion(
             std::filesystem::path(rom_path),
             ArchiveType::O2R,
@@ -492,6 +529,41 @@ int torch_extract_o2r(const char *rom_path, const char *src_dir, const char *dst
         Companion::Instance = nullptr;
         delete instance;
         derive_android_css_stage_assets(rom_path, dst_dir);
+
+        if (have_original_cwd) {
+            std::filesystem::current_path(original_cwd, cwd_ec); // best-effort restore
+        }
+
+        // Self-healing fallback: if the archive still isn't where the rest
+        // of the app expects it, check the other places it may realistically
+        // have landed and move it into dst_dir instead of surfacing a
+        // dead-end "success but missing" error.
+        const std::filesystem::path expected = dst_path / "BattleShip.o2r";
+        if (!std::filesystem::exists(expected, ec)) {
+            std::vector<std::filesystem::path> candidates;
+            if (have_original_cwd) candidates.push_back(original_cwd / "BattleShip.o2r");
+            candidates.push_back(std::filesystem::path(src_dir) / "BattleShip.o2r");
+            candidates.push_back(std::filesystem::path(rom_path).parent_path() / "BattleShip.o2r");
+
+            for (const auto &candidate : candidates) {
+                std::error_code exists_ec;
+                if (std::filesystem::exists(candidate, exists_ec) && !exists_ec) {
+                    LOGI("torch_extract_o2r: found stray BattleShip.o2r at %s, moving to %s",
+                         candidate.string().c_str(), expected.string().c_str());
+                    std::error_code move_ec;
+                    std::filesystem::rename(candidate, expected, move_ec);
+                    if (move_ec) {
+                        // rename() fails across filesystems/mount points —
+                        // fall back to copy+delete.
+                        std::filesystem::copy_file(candidate, expected,
+                            std::filesystem::copy_options::overwrite_existing, move_ec);
+                        if (!move_ec) std::filesystem::remove(candidate, move_ec);
+                    }
+                    break;
+                }
+            }
+        }
+
         return 0;
     } catch (const std::exception &e) {
         LOGE("torch_extract_o2r: std::exception: %s", e.what());
